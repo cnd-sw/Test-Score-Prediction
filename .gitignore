@@ -18,3 +18,4 @@ test.csv
 train.csv
 ultra_output.log
 info.md
+catboost_info/
