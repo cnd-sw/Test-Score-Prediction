@@ -1,0 +1,267 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import mean_squared_error
+import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostRegressor
+import warnings
+warnings.filterwarnings('ignore')
+
+print("Loading data...")
+train = pd.read_csv('train.csv')
+test = pd.read_csv('test.csv')
+sample_submission = pd.read_csv('sample_submission.csv')
+
+print(f"Train shape: {train.shape}")
+print(f"Test shape: {test.shape}")
+
+def feature_engineering(df, is_train=True):
+    """Advanced feature engineering"""
+    df = df.copy()
+    
+    # Interaction features
+    df['study_attendance_interaction'] = df['study_hours'] * df['class_attendance']
+    df['study_sleep_interaction'] = df['study_hours'] * df['sleep_hours']
+    df['attendance_sleep_interaction'] = df['class_attendance'] * df['sleep_hours']
+    
+    # Polynomial features for important variables
+    df['study_hours_squared'] = df['study_hours'] ** 2
+    df['study_hours_cubed'] = df['study_hours'] ** 3
+    df['class_attendance_squared'] = df['class_attendance'] ** 2
+    df['sleep_hours_squared'] = df['sleep_hours'] ** 2
+    
+    # Ratio features
+    df['study_per_age'] = df['study_hours'] / (df['age'] + 1)
+    df['sleep_per_age'] = df['sleep_hours'] / (df['age'] + 1)
+    df['study_sleep_ratio'] = df['study_hours'] / (df['sleep_hours'] + 0.1)
+    
+    # Binning continuous features
+    df['age_bin'] = pd.cut(df['age'], bins=[0, 19, 21, 23, 100], labels=['young', 'mid_young', 'mid_old', 'old'])
+    df['study_hours_bin'] = pd.cut(df['study_hours'], bins=[-1, 2, 4, 6, 10], labels=['low', 'medium', 'high', 'very_high'])
+    df['attendance_bin'] = pd.cut(df['class_attendance'], bins=[-1, 50, 75, 90, 100], labels=['poor', 'average', 'good', 'excellent'])
+    
+    # Aggregate features by categorical variables
+    if is_train:
+        # Store aggregations for test set
+        global agg_features
+        agg_features = {}
+        
+        for cat_col in ['gender', 'course', 'study_method', 'exam_difficulty', 'facility_rating', 'sleep_quality']:
+            agg_features[f'{cat_col}_mean_study'] = df.groupby(cat_col)['study_hours'].mean().to_dict()
+            agg_features[f'{cat_col}_mean_attendance'] = df.groupby(cat_col)['class_attendance'].mean().to_dict()
+            
+            df[f'{cat_col}_mean_study'] = df[cat_col].map(agg_features[f'{cat_col}_mean_study'])
+            df[f'{cat_col}_mean_attendance'] = df[cat_col].map(agg_features[f'{cat_col}_mean_attendance'])
+    else:
+        for cat_col in ['gender', 'course', 'study_method', 'exam_difficulty', 'facility_rating', 'sleep_quality']:
+            df[f'{cat_col}_mean_study'] = df[cat_col].map(agg_features[f'{cat_col}_mean_study'])
+            df[f'{cat_col}_mean_attendance'] = df[cat_col].map(agg_features[f'{cat_col}_mean_attendance'])
+    
+    return df
+
+print("\nApplying feature engineering...")
+train = feature_engineering(train, is_train=True)
+test = feature_engineering(test, is_train=False)
+
+# Encode categorical variables
+categorical_cols = ['gender', 'course', 'internet_access', 'sleep_quality', 'study_method', 
+                   'facility_rating', 'exam_difficulty', 'age_bin', 'study_hours_bin', 'attendance_bin']
+
+label_encoders = {}
+for col in categorical_cols:
+    le = LabelEncoder()
+    train[col] = le.fit_transform(train[col].astype(str))
+    test[col] = le.transform(test[col].astype(str))
+    label_encoders[col] = le
+
+# Prepare features
+feature_cols = [col for col in train.columns if col not in ['id', 'exam_score']]
+X = train[feature_cols]
+y = train['exam_score']
+X_test = test[feature_cols]
+
+print(f"\nNumber of features: {len(feature_cols)}")
+print(f"Features: {feature_cols}")
+
+# Cross-validation setup
+n_folds = 10
+kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+# Model 1: LightGBM
+print("\n" + "="*50)
+print("Training LightGBM...")
+print("="*50)
+
+lgb_params = {
+    'objective': 'regression',
+    'metric': 'rmse',
+    'boosting_type': 'gbdt',
+    'num_leaves': 127,
+    'learning_rate': 0.01,
+    'feature_fraction': 0.8,
+    'bagging_fraction': 0.8,
+    'bagging_freq': 5,
+    'max_depth': 10,
+    'min_child_samples': 20,
+    'reg_alpha': 0.1,
+    'reg_lambda': 0.1,
+    'verbose': -1,
+    'random_state': 42
+}
+
+lgb_oof = np.zeros(len(X))
+lgb_preds = np.zeros(len(X_test))
+
+for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
+    print(f"\nFold {fold + 1}/{n_folds}")
+    X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+    y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+    
+    lgb_train = lgb.Dataset(X_train, y_train)
+    lgb_val = lgb.Dataset(X_val, y_val, reference=lgb_train)
+    
+    model = lgb.train(
+        lgb_params,
+        lgb_train,
+        num_boost_round=10000,
+        valid_sets=[lgb_train, lgb_val],
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=100),
+            lgb.log_evaluation(period=500)
+        ]
+    )
+    
+    lgb_oof[val_idx] = model.predict(X_val)
+    lgb_preds += model.predict(X_test) / n_folds
+    
+    fold_rmse = np.sqrt(mean_squared_error(y_val, lgb_oof[val_idx]))
+    print(f"Fold {fold + 1} RMSE: {fold_rmse:.6f}")
+
+lgb_cv_rmse = np.sqrt(mean_squared_error(y, lgb_oof))
+print(f"\nLightGBM CV RMSE: {lgb_cv_rmse:.6f}")
+
+# Model 2: XGBoost
+print("\n" + "="*50)
+print("Training XGBoost...")
+print("="*50)
+
+xgb_params = {
+    'objective': 'reg:squarederror',
+    'eval_metric': 'rmse',
+    'max_depth': 8,
+    'learning_rate': 0.01,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'min_child_weight': 3,
+    'reg_alpha': 0.1,
+    'reg_lambda': 0.1,
+    'random_state': 42,
+    'tree_method': 'hist'
+}
+
+xgb_oof = np.zeros(len(X))
+xgb_preds = np.zeros(len(X_test))
+
+for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
+    print(f"\nFold {fold + 1}/{n_folds}")
+    X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+    y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+    
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dval = xgb.DMatrix(X_val, label=y_val)
+    
+    model = xgb.train(
+        xgb_params,
+        dtrain,
+        num_boost_round=10000,
+        evals=[(dtrain, 'train'), (dval, 'val')],
+        early_stopping_rounds=100,
+        verbose_eval=500
+    )
+    
+    xgb_oof[val_idx] = model.predict(dval)
+    xgb_preds += model.predict(xgb.DMatrix(X_test)) / n_folds
+    
+    fold_rmse = np.sqrt(mean_squared_error(y_val, xgb_oof[val_idx]))
+    print(f"Fold {fold + 1} RMSE: {fold_rmse:.6f}")
+
+xgb_cv_rmse = np.sqrt(mean_squared_error(y, xgb_oof))
+print(f"\nXGBoost CV RMSE: {xgb_cv_rmse:.6f}")
+
+# Model 3: CatBoost
+print("\n" + "="*50)
+print("Training CatBoost...")
+print("="*50)
+
+cat_params = {
+    'iterations': 10000,
+    'learning_rate': 0.01,
+    'depth': 8,
+    'l2_leaf_reg': 3,
+    'random_seed': 42,
+    'verbose': 500,
+    'early_stopping_rounds': 100,
+    'task_type': 'CPU'
+}
+
+cat_oof = np.zeros(len(X))
+cat_preds = np.zeros(len(X_test))
+
+for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
+    print(f"\nFold {fold + 1}/{n_folds}")
+    X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+    y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+    
+    model = CatBoostRegressor(**cat_params)
+    model.fit(
+        X_train, y_train,
+        eval_set=(X_val, y_val),
+        use_best_model=True
+    )
+    
+    cat_oof[val_idx] = model.predict(X_val)
+    cat_preds += model.predict(X_test) / n_folds
+    
+    fold_rmse = np.sqrt(mean_squared_error(y_val, cat_oof[val_idx]))
+    print(f"Fold {fold + 1} RMSE: {fold_rmse:.6f}")
+
+cat_cv_rmse = np.sqrt(mean_squared_error(y, cat_oof))
+print(f"\nCatBoost CV RMSE: {cat_cv_rmse:.6f}")
+
+# Ensemble predictions
+print("\n" + "="*50)
+print("Creating ensemble...")
+print("="*50)
+
+# Weighted average ensemble
+weights = [0.35, 0.35, 0.30]  # LGB, XGB, CAT
+ensemble_oof = weights[0] * lgb_oof + weights[1] * xgb_oof + weights[2] * cat_oof
+ensemble_preds = weights[0] * lgb_preds + weights[1] * xgb_preds + weights[2] * cat_preds
+
+ensemble_cv_rmse = np.sqrt(mean_squared_error(y, ensemble_oof))
+print(f"\nEnsemble CV RMSE: {ensemble_cv_rmse:.6f}")
+
+print("\n" + "="*50)
+print("Summary of Results:")
+print("="*50)
+print(f"LightGBM CV RMSE:  {lgb_cv_rmse:.6f}")
+print(f"XGBoost CV RMSE:   {xgb_cv_rmse:.6f}")
+print(f"CatBoost CV RMSE:  {cat_cv_rmse:.6f}")
+print(f"Ensemble CV RMSE:  {ensemble_cv_rmse:.6f}")
+
+# Create submission
+submission = sample_submission.copy()
+submission['exam_score'] = ensemble_preds
+
+submission.to_csv('submission.csv', index=False)
+print("\nSubmission file created: submission.csv")
+print(f"Submission shape: {submission.shape}")
+print(f"\nFirst few predictions:")
+print(submission.head(10))
+print(f"\nPrediction statistics:")
+print(f"Mean: {submission['exam_score'].mean():.2f}")
+print(f"Std: {submission['exam_score'].std():.2f}")
+print(f"Min: {submission['exam_score'].min():.2f}")
+print(f"Max: {submission['exam_score'].max():.2f}")
